@@ -2,8 +2,14 @@ name = "da-config-backup"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+[observability]
+enabled = true
+
 [triggers]
-crons = ["0 6 * * *"]   # every day at 06:00 UTC — adjust as needed
+crons = [
+  "0 6 * * *",     # daily: start a new backup session
+  "*/10 * * * *",  # every 10 min: continue an active session until all keys are processed
+]
 
 [[kv_namespaces]]
 binding = "DA_CONFIG"

@@ -2,46 +2,79 @@ import processQueue from '@adobe/helix-shared-process-queue';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
+export const BATCH_SIZE = 200; // max keys per invocation — 200*(2–4) + overhead stays below 1,000 subrequest limit
+export const STATE_KEY = '__backup_state__'; // tracks active backup session in DA_CONFIG KV
 
 export default {
-  // Scheduled trigger (cron)
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runBackup(env));
+    if (event.cron === '0 6 * * *') {
+      // Daily trigger: start a fresh backup session
+      ctx.waitUntil(startBackup(env));
+    } else {
+      // Continuation trigger: process next batch if a session is active
+      ctx.waitUntil(continueBackup(env));
+    }
   },
 
-  // Manual trigger for local dev / testing
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/run') {
-      await runBackup(env);
+      // Dev/test: start and drain all batches sequentially in one HTTP invocation
+      await startBackup(env);
+      let raw = await env.DA_CONFIG.get(STATE_KEY, { type: 'text' });
+      while (raw) {
+        const state = JSON.parse(raw);
+        if (state.done) break;
+        await processBatch(env, state);
+        raw = await env.DA_CONFIG.get(STATE_KEY, { type: 'text' });
+      }
       return new Response('Backup complete', { status: 200 });
     }
     return new Response('Not found', { status: 404 });
   },
 };
 
-export async function runBackup(env) {
-  // List ALL keys in DA_CONFIG KV — paginate (max 1000 per call)
-  const keys = [];
-  let cursor;
-  do {
-    const listed = await env.DA_CONFIG.list({ cursor, limit: 1000 });
-    keys.push(...listed.keys.map((k) => k.name));
-    cursor = listed.list_complete ? undefined : listed.cursor;
-  } while (cursor);
-
+export async function startBackup(env) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const state = { cursor: null, timestamp };
+  await env.DA_CONFIG.put(STATE_KEY, JSON.stringify(state));
+  await processBatch(env, state);
+}
 
-  await processQueue(keys, (key) => processKey(key, env, timestamp), { maxConcurrent: 10 });
+export async function continueBackup(env) {
+  const raw = await env.DA_CONFIG.get(STATE_KEY, { type: 'text' });
+  if (!raw) return; // no active session
+  const state = JSON.parse(raw);
+  if (state.done) return; // session already complete
+  await processBatch(env, state);
+}
+
+export async function processBatch(env, state) {
+  const listed = await env.DA_CONFIG.list({ cursor: state.cursor || undefined, limit: BATCH_SIZE });
+  const keys = listed.keys.map((k) => k.name).filter((k) => k !== STATE_KEY);
+
+  await processQueue(keys, (key) => processKey(key, env, state.timestamp), { maxConcurrent: 5 });
+
+  const nextState = listed.list_complete
+    ? { ...state, done: true }
+    : { ...state, cursor: listed.cursor };
+
+  await env.DA_CONFIG.put(STATE_KEY, JSON.stringify(nextState));
+
+  if (listed.list_complete) {
+    console.log(`[da-config-backup] Backup session ${state.timestamp} complete.`);
+  } else {
+    console.log(`[da-config-backup] Processed batch, continuing next invocation (cursor: ${listed.cursor}).`);
+  }
 }
 
 export async function processKey(key, env, timestamp, attempt = 1) {
   try {
-    // 1. R2 keys — encode each segment to handle special characters, preserving '/' for nesting
+    // R2 keys — encode each segment to handle special characters, preserving '/' for nesting
     const safeKey = key.split('/').map(encodeURIComponent).join('/');
     const latestR2Key = `${safeKey}/latest.json`;
 
-    // 2. Fetch KV value and last R2 value in parallel
+    // Fetch KV value and last R2 value in parallel
     const [currentValue, existing] = await Promise.all([
       env.DA_CONFIG.get(key, { type: 'text' }),
       env.BACKUP_BUCKET.get(latestR2Key),
@@ -49,10 +82,10 @@ export async function processKey(key, env, timestamp, attempt = 1) {
     if (currentValue === null) return;
     const lastValue = existing ? await existing.text() : null;
 
-    // 3. Simple string compare — a reformat counts as a change
-    if (lastValue === currentValue) return; // no change
+    // Simple string compare — a reformat counts as a change
+    if (lastValue === currentValue) return;
 
-    // 4. Different — write timestamped archive + overwrite latest
+    // Different — write timestamped archive + overwrite latest
     const archiveR2Key = `${safeKey}/${timestamp}.json`;
     await Promise.all([
       env.BACKUP_BUCKET.put(archiveR2Key, currentValue, {
