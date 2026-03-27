@@ -6,17 +6,24 @@ compatibility_date = "2024-01-01"
 enabled = true
 
 [triggers]
-crons = [
-  "0 6 * * *",     # daily: start a new backup session
-  "*/10 * * * *",  # every 10 min: continue an active session until all keys are processed
-]
+crons = ["0 6 * * *"]  # daily: kick off a new backup session
+
+[[queues.producers]]
+queue = "da-config-backup-queue"
+binding = "BACKUP_QUEUE"
+
+[[queues.consumers]]
+queue = "da-config-backup-queue"
+max_batch_size = 1      # one batch message at a time
+max_batch_timeout = 1
+max_retries = 3
 
 [[kv_namespaces]]
 binding = "DA_CONFIG"
 id = "a20824737cd8499bae0f0d887ac6db21"
-# remote = true
+remote = true
 
 [[r2_buckets]]
 binding = "BACKUP_BUCKET"
 bucket_name = "aem-config-backup"
-# remote = true
+remote = true
