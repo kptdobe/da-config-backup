@@ -9,14 +9,23 @@ Cloudflare Worker that backs up all keys from a DA Config KV namespace to an R2 
 3. **Write** — if the value has changed, writes two R2 objects:
    - `<key>/latest.json` — always reflects the current value
    - `<key>/<timestamp>.json` — immutable timestamped snapshot
+4. **ew-enabled index** — regardless of whether the backup value changed, each key's config is parsed for `ew.enabled` (in the `flags` sheet) and `editor.path` overrides (in the first/`data` sheet). These are accumulated across the whole session and written once, at the end, to:
+   - `_indexes/ew-enabled/latest.json`
+   - `_indexes/ew-enabled/<timestamp>.json`
 
-Keys with path segments (containing `/`) are encoded per-segment so the R2 hierarchy is preserved. Keys with no change since the last run are skipped. Failed keys are retried up to 3 times with exponential backoff.
+   The index is a flat map keyed by path prefix (`org`, `org/site`, or deeper `org/site/some/path`). Each entry is `{ type: "canvas" | "form" | "edit", source: "ew.enabled" | "editor.path" }` — `type` is the effective editor for that path, and `source` records which config mechanism produced it, replicating the exact override precedence used at runtime by da-live/da-nx: `ew.enabled` sets the default for that org/site (`source: "ew.enabled"`), and any `editor.path` row is an explicit override that wins outright for its (and any deeper) path, regardless of `ew.enabled` (`source: "editor.path"`). Consumers resolve the effective entry for any path via a segment-boundary-aware longest-prefix match.
+
+   Since Workers invocations don't share memory across queue messages, the in-progress index travels *inside* the queue message body itself (alongside `cursor`/`timestamp`) and is written to R2 exactly once, by the single invocation that sees `list_complete`.
+
+Keys with path segments (containing `/`) are encoded per-segment so the R2 hierarchy is preserved. Keys with no change since the last run are skipped for the backup write (the ew-index is still updated for them). Failed keys are retried up to 3 times with exponential backoff.
 
 ## R2 layout
 
 ```
 <encoded-key>/latest.json                      ← current value (overwritten each run)
 <encoded-key>/2026-03-26T06-00-00-000Z.json    ← snapshot written on change
+_indexes/ew-enabled/latest.json                ← aggregate ew-enabled index (current)
+_indexes/ew-enabled/2026-03-26T06-00-00-000Z.json  ← aggregate snapshot for this session
 ```
 
 ## Schedule
@@ -68,6 +77,36 @@ The `/run` endpoint triggers a full backup synchronously, which is useful for te
 
 ```
 [da-config-backup] Change detected for "<key>" — saved <archive-key> + <latest-key>
+```
+
+`wrangler.toml` has `remote = true` on both bindings, so `wrangler dev` talks to the **real** `DA_CONFIG` KV and `aem-config-backup` R2 bucket — there's no local/mock mode to switch to. Two ways to exercise it locally:
+
+- **`/run?limit=N`** — caps the KV `.list` page size (keys per page), not the total processed. Without `?maxKeys=N` (below), `/run` still drains the **entire** namespace, just in smaller pages — useful mainly combined with `maxKeys` for a bounded local sample:
+  ```bash
+  curl "http://localhost:8787/run?limit=1"   # drains everything, 1 key per page (slow!)
+  ```
+  This bypasses the queue (loops `processBatch` directly in one request), so it's fast to invoke but doesn't validate the queue message round-trip.
+- **`/run?maxKeys=N`** — caps the TOTAL number of keys processed this run and stops early once reached, instead of draining the whole namespace. This is what you want for a quick local sample:
+  ```bash
+  curl "http://localhost:8787/run?maxKeys=50&dryRun=1" | jq .   # sample the first ~50 keys, no writes
+  ```
+  A capped/early-stopped run never writes a "session complete" ew-index to R2 (it's a partial sample, not the real full-namespace state) — the response says `Stopped early after N keys...` (or, combined with `dryRun`, returns JSON with `"partial": true`).
+- **`/run?indexOnly=1`** — skips the per-key backup diff/write entirely (only reads `DA_CONFIG`, never touches the backup archive in R2) but still writes the ew-enabled index to R2 as usual (unless capped early via `maxKeys`). Use this to regenerate/test the aggregate index without recreating any backups:
+  ```bash
+  curl "http://localhost:8787/run?indexOnly=1"
+  ```
+- **`/run?dryRun=1`** — fully read-only: also skips writing the index to R2, and returns the computed `{ generatedAt, totals, paths }` JSON directly in the response body instead of "Backup complete", so you can inspect the result locally without touching R2 at all. Combine with `maxKeys` for a fast, bounded, zero-write test run:
+  ```bash
+  curl "http://localhost:8787/run?dryRun=1&maxKeys=50" | jq .
+  ```
+- **Trigger the real cron + queue path** — validates that the `{ cursor, timestamp, index }` accumulator actually survives serialization across queue messages (important before deploying changes near the 128KB message-size limit):
+  ```bash
+  curl "http://localhost:8787/__scheduled"
+  ```
+
+Inspect the written aggregate index:
+```bash
+npx wrangler r2 object get aem-config-backup/_indexes/ew-enabled/latest.json --remote --pipe | jq .
 ```
 
 ## Deploy

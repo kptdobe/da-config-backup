@@ -11,6 +11,7 @@ export default [
         Request: 'readonly',
         Promise: 'readonly',
         Date: 'readonly',
+        TextEncoder: 'readonly',
       },
     },
     rules: {
