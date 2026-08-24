@@ -141,6 +141,20 @@ describe('buildEwEntries', () => {
       'org/site': { ew: false, editorTypes: 'c' },
     });
   });
+
+  it('attributes an org-prefixed editor.path to its second path segment', () => {
+    const json = {
+      data: {
+        data: [{
+          key: 'editor.path',
+          value: '/waterscorporation/it-waters-website=https://da.live/canvas#',
+        }],
+      },
+    };
+    expect(buildEwEntries('waterscorporation', json)).toEqual({
+      'waterscorporation/it-waters-website': { editorTypes: 'c' },
+    });
+  });
 });
 
 describe('mergeIntoIndex', () => {

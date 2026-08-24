@@ -55,8 +55,9 @@ export function buildEwEntries(kvKey, json) {
   const defaultType = extractEwEnabledDefault(json);
   if (defaultType) entries[kvKey] = { ew: defaultType === 'canvas' };
   for (const { pathPrefix, type } of extractEditorPathOverrides(json)) {
-    const firstPathSegment = pathPrefix.split('/').filter(Boolean)[0];
-    const siteKey = kvKey.includes('/') ? kvKey : firstPathSegment ? `${kvKey}/${firstPathSegment}` : null;
+    const pathSegments = pathPrefix.split('/').filter(Boolean);
+    const site = pathSegments[0] === kvKey ? pathSegments[1] : pathSegments[0];
+    const siteKey = kvKey.includes('/') ? kvKey : site ? `${kvKey}/${site}` : null;
     if (!siteKey) continue;
     const current = entries[siteKey] ?? {};
     const types = new Set(current.editorTypes ?? '');
