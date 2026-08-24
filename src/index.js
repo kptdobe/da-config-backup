@@ -4,6 +4,9 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
 const BATCH_SIZE = 200;   // ~200*(2-4) + overhead stays below 1,000 subrequest limit
 const EW_INDEX_SIZE_WARNING_BYTES = 100_000; // headroom under the 128KB queue message cap
+const QUEUE_MESSAGE_MAX_BYTES = 128_000;
+const EDITOR_TYPE_CODES = { canvas: 'c', form: 'f', edit: 'e' };
+const EDITOR_TYPE_CODE_ORDER = ['c', 'f', 'e'];
 
 // ─── ew-enabled index ────────────────────────────────────────────────────────
 //
@@ -15,19 +18,14 @@ const EW_INDEX_SIZE_WARNING_BYTES = 100_000; // headroom under the 128KB queue m
 //     when the site config explicitly sets the flag, so an unset site falls
 //     back to the org entry via prefix lookup.
 //   - `data.data` rows keyed `editor.path` (format `<pathPrefix>=<editorUrl>`)
-//     are explicit per-path overrides that win over the default regardless of
-//     `ew.enabled` (see da-live's da-browse.js `getEditor()` — longest
-//     matching path prefix wins outright). We store these as deeper keys in
-//     the same flat map: `${kvKey}${pathPrefix}`.
+//     are summarized by target site and editor type. Individual content paths
+//     are intentionally omitted because ew-report usage is only available at
+//     org/site granularity.
 //
-// Each entry is `{ type: 'canvas'|'form'|'edit', source: 'ew.enabled'|'editor.path' }`
-// — `source` records *which* config mechanism produced the effective type, so
-// consumers (e.g. ew-report) can distinguish "canvas because ew.enabled=true"
-// from "canvas because of an explicit editor.path row" in reporting.
-//
-// Consumers resolve the effective entry for any org/site/path by walking path
-// segments and keeping the value of the longest key seen (segment-boundary
-// aware, not naive string prefix) — see ew-report's resolveEditorType.
+// Each sparse `configs` entry is `{ ew?: boolean, editorTypes?: string }`.
+// `ew` records an explicit ew.enabled value. `editorTypes` is a compact,
+// canonical string containing any editor.path types configured for that site:
+// `c` = canvas, `f` = form, `e` = classic edit.
 
 export function extractEwEnabledDefault(json) {
   const row = json?.flags?.data?.find((r) => r.key === 'ew.enabled');
@@ -55,15 +53,24 @@ export function extractEditorPathOverrides(json) {
 export function buildEwEntries(kvKey, json) {
   const entries = {};
   const defaultType = extractEwEnabledDefault(json);
-  if (defaultType) entries[kvKey] = { type: defaultType, source: 'ew.enabled' };
+  if (defaultType) entries[kvKey] = { ew: defaultType === 'canvas' };
   for (const { pathPrefix, type } of extractEditorPathOverrides(json)) {
-    entries[`${kvKey}${pathPrefix}`] = { type, source: 'editor.path' };
+    const firstPathSegment = pathPrefix.split('/').filter(Boolean)[0];
+    const siteKey = kvKey.includes('/') ? kvKey : firstPathSegment ? `${kvKey}/${firstPathSegment}` : null;
+    if (!siteKey) continue;
+    const current = entries[siteKey] ?? {};
+    const types = new Set(current.editorTypes ?? '');
+    types.add(EDITOR_TYPE_CODES[type]);
+    entries[siteKey] = {
+      ...current,
+      editorTypes: EDITOR_TYPE_CODE_ORDER.filter((code) => types.has(code)).join(''),
+    };
   }
   return entries;
 }
 
 export function createEmptyIndex() {
-  return { paths: {}, totals: { orgConfigs: 0, siteConfigs: 0 } };
+  return { configs: {}, totals: { orgConfigs: 0, siteConfigs: 0 } };
 }
 
 /** Synchronous, single-threaded merge of one batch's processKey results into the accumulator. */
@@ -71,7 +78,17 @@ export function mergeIntoIndex(index, results) {
   for (const result of results) {
     if (!result) continue;
     const { key, entries } = result;
-    Object.assign(index.paths, entries);
+    for (const [configKey, entry] of Object.entries(entries)) {
+      const current = index.configs[configKey] ?? {};
+      const types = new Set(`${current.editorTypes ?? ''}${entry.editorTypes ?? ''}`);
+      index.configs[configKey] = {
+        ...current,
+        ...entry,
+        ...(types.size > 0
+          ? { editorTypes: EDITOR_TYPE_CODE_ORDER.filter((code) => types.has(code)).join('') }
+          : {}),
+      };
+    }
     if (key.includes('/')) {
       index.totals.siteConfigs += 1;
     } else {
@@ -85,13 +102,8 @@ export async function writeIndex(env, timestamp, index) {
   const payload = JSON.stringify({
     generatedAt: new Date().toISOString(),
     totals: index.totals,
-    paths: index.paths,
+    configs: index.configs,
   }, null, 2);
-
-  const size = new TextEncoder().encode(payload).length;
-  if (size > EW_INDEX_SIZE_WARNING_BYTES) {
-    console.warn(`[da-config-backup] ew-enabled index is ${size} bytes — approaching the 128KB queue message limit.`);
-  }
 
   await Promise.all([
     env.BACKUP_BUCKET.put(`_indexes/ew-enabled/${timestamp}.json`, payload, {
@@ -118,7 +130,15 @@ export default {
       if (!result.done) {
         // Schedule next batch in BATCH_DELAY_S seconds — the accumulator travels
         // with it, since batches are strictly sequential (max_batch_size: 1)
-        await env.BACKUP_QUEUE.send({ cursor: result.cursor, timestamp, index: result.index });
+        const nextMessage = { cursor: result.cursor, timestamp, index: result.index };
+        const messageSize = new TextEncoder().encode(JSON.stringify(nextMessage)).length;
+        if (messageSize > QUEUE_MESSAGE_MAX_BYTES) {
+          throw new Error(`EW index queue message is ${messageSize} bytes, above the ${QUEUE_MESSAGE_MAX_BYTES}-byte limit`);
+        }
+        if (messageSize > EW_INDEX_SIZE_WARNING_BYTES) {
+          console.warn(`[da-config-backup] EW index queue message is ${messageSize} bytes — approaching the 128KB limit.`);
+        }
+        await env.BACKUP_QUEUE.send(nextMessage);
       }
 
       message.ack();

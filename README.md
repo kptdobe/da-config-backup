@@ -13,7 +13,7 @@ Cloudflare Worker that backs up all keys from a DA Config KV namespace to an R2 
    - `_indexes/ew-enabled/latest.json`
    - `_indexes/ew-enabled/<timestamp>.json`
 
-   The index is a flat map keyed by path prefix (`org`, `org/site`, or deeper `org/site/some/path`). Each entry is `{ type: "canvas" | "form" | "edit", source: "ew.enabled" | "editor.path" }` — `type` is the effective editor for that path, and `source` records which config mechanism produced it, replicating the exact override precedence used at runtime by da-live/da-nx: `ew.enabled` sets the default for that org/site (`source: "ew.enabled"`), and any `editor.path` row is an explicit override that wins outright for its (and any deeper) path, regardless of `ew.enabled` (`source: "editor.path"`). Consumers resolve the effective entry for any path via a segment-boundary-aware longest-prefix match.
+   The sparse `configs` map is keyed by `org` or `org/site`. Each entry is `{ ew?: boolean, editorTypes?: string }`: `ew` records an explicitly configured `ew.enabled` value, while `editorTypes` summarizes which `editor.path` editors occur anywhere in that site (`c` = canvas, `f` = form, `e` = classic edit). Individual content paths are intentionally omitted because ew-report usage metrics are only available at org/site granularity. Org-level `editor.path` rows are attributed to the site named by the first path segment.
 
    Since Workers invocations don't share memory across queue messages, the in-progress index travels *inside* the queue message body itself (alongside `cursor`/`timestamp`) and is written to R2 exactly once, by the single invocation that sees `list_complete`.
 
