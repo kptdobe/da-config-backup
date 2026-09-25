@@ -549,6 +549,7 @@ describe('queue handler', () => {
     const published = JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']);
     expect(published.configs.org).toEqual({ ew: true });
     expect(published.totals).toEqual({ orgConfigs: 1, siteConfigs: 1 });
+    expect(published.harnessFlagsIndexed).toBe(false);
   });
 });
 
@@ -592,6 +593,7 @@ describe('fetch handler', () => {
     await worker.fetch(new Request('http://localhost/run'), env);
 
     const written = JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']);
+    expect(written.harnessFlagsIndexed).toBe(true);
     expect(written.totals).toEqual({ orgConfigs: 2, siteConfigs: 0 });
     expect(written.configs).toEqual({
       'frescopa-org': { ew: true },
@@ -639,6 +641,7 @@ describe('fetch handler', () => {
     expect(env.BACKUP_BUCKET.get).not.toHaveBeenCalled();
 
     const body = await res.json();
+    expect(body.harnessFlagsIndexed).toBe(true);
     expect(body.totals).toEqual({ orgConfigs: 2, siteConfigs: 0 });
     expect(body.configs).toEqual({
       'frescopa-org': { ew: true },

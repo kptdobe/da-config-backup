@@ -134,9 +134,10 @@ function previousRunTimestamp(object, body) {
   return previous.replace(/[:.]/g, '-');
 }
 
-export async function writeIndex(env, timestamp, index, runId = timestamp) {
+export async function writeIndex(env, timestamp, index, runId = timestamp, harnessFlagsIndexed = true) {
   const payload = JSON.stringify({
     generatedAt: new Date().toISOString(),
+    harnessFlagsIndexed,
     totals: index.totals,
     configs: index.configs,
   }, null, 2);
@@ -212,7 +213,7 @@ export async function completeRun(env, timestamp, runId, lastBatchNo) {
     nextCursor = batch.nextCursor;
     mergeIndexPart(index, batch.index);
   }
-  await writeIndex(env, timestamp, index, runId);
+  await writeIndex(env, timestamp, index, runId, !runId.endsWith('-legacy'));
 }
 
 export default {
@@ -298,6 +299,7 @@ export default {
       if (dryRun) {
         return new Response(JSON.stringify({
           generatedAt: new Date().toISOString(),
+          harnessFlagsIndexed: true,
           partial: cappedEarly,
           keysProcessed: totalKeysProcessed,
           ...index,
