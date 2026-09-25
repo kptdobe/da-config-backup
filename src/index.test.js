@@ -3,10 +3,15 @@ import worker, {
   processBatch,
   processKey,
   extractEwEnabledDefault,
+  extractCoworkerFlag,
   extractEditorPathOverrides,
   buildEwEntries,
   createEmptyIndex,
   mergeIntoIndex,
+  mergeIndexPart,
+  batchKey,
+  completeRun,
+  writeIndex,
 } from './index.js';
 
 // The user's real example org config (frescopa) — multi-sheet, ew.enabled=true,
@@ -48,15 +53,26 @@ function makeKv(store = {}) {
 }
 
 function makeR2(store = {}) {
+  const objects = new Map(Object.entries(store).map(([key, value]) => [key, {
+    value, etag: `initial-${key}`, customMetadata: {},
+  }]));
+  let version = 0;
   const bucket = {
     _store: { ...store },
     get: vi.fn(async (key) => {
-      const val = bucket._store[key];
-      if (val === undefined) return null;
-      return { text: async () => val };
+      const object = objects.get(key);
+      if (!object) return null;
+      return { ...object, text: async () => object.value };
     }),
-    put: vi.fn(async (key, value) => {
+    put: vi.fn(async (key, value, options = {}) => {
+      const previous = objects.get(key);
+      if (options.onlyIf instanceof Headers
+        && options.onlyIf.get('If-None-Match') === '*' && previous) return null;
+      if (options.onlyIf?.etagMatches && previous?.etag !== options.onlyIf.etagMatches) return null;
+      const object = { value, etag: `version-${++version}`, customMetadata: options.customMetadata ?? {} };
+      objects.set(key, object);
       bucket._store[key] = value;
+      return object;
     }),
   };
   return bucket;
@@ -75,6 +91,24 @@ function makeEnv(kvStore = {}, r2Store = {}) {
 describe('extractEwEnabledDefault', () => {
   it('returns "canvas" when ew.enabled is the string "true"', () => {
     expect(extractEwEnabledDefault(REAL_ORG_CONFIG)).toBe('canvas');
+  });
+
+  describe('extractCoworkerFlag', () => {
+    it('records both explicit true and false, but not an absent flag', () => {
+      expect(extractCoworkerFlag({ flags: { data: [{ key: 'ew.coworker', value: 'true' }] } })).toBe(true);
+      expect(extractCoworkerFlag({ flags: { data: [{ key: 'ew.coworker', value: 'false' }] } })).toBe(false);
+      expect(extractCoworkerFlag({ flags: { data: [{ key: 'ew.coworkerManifest', value: 'example' }] } })).toBeNull();
+    });
+
+    it('preserves an invalid explicit value as disabled, matching the runtime', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        expect(extractCoworkerFlag({ flags: { data: [{ key: 'ew.coworker', value: 'yes' }] } })).toBe(false);
+        expect(warn).toHaveBeenCalledOnce();
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   it('returns "edit" when ew.enabled is "false"', () => {
@@ -130,6 +164,18 @@ describe('buildEwEntries', () => {
 
   it('returns an empty object when neither ew.enabled nor editor.path is set', () => {
     expect(buildEwEntries('org/site', { flags: { data: [] } })).toEqual({});
+  });
+
+  it('records explicit Coworker flags independently of ew.enabled', () => {
+    expect(buildEwEntries('org', {
+      flags: { data: [{ key: 'ew.coworker', value: 'true' }] },
+    })).toEqual({ org: { coworker: true } });
+    expect(buildEwEntries('org/site', {
+      flags: { data: [
+        { key: 'ew.enabled', value: 'true' },
+        { key: 'ew.coworker', value: 'false' },
+      ] },
+    })).toEqual({ 'org/site': { ew: true, coworker: false } });
   });
 
   it('editor.path override coexists with a differing ew.enabled default at the same key', () => {
@@ -189,6 +235,86 @@ describe('mergeIntoIndex', () => {
       { key: 'org1/siteA', entries: { 'org1/siteA': { ew: false, editorTypes: 'e' } } },
     ]);
     expect(index.configs['org1/siteA']).toEqual({ ew: false, editorTypes: 'cfe' });
+  });
+});
+
+describe('R2 batch index', () => {
+  it('merges config entries across batches and counts each processed key once', () => {
+    const index = createEmptyIndex();
+    mergeIndexPart(index, {
+      configs: { org: { ew: true, coworker: true }, 'org/site': { editorTypes: 'c' } },
+      totals: { orgConfigs: 1, siteConfigs: 0 },
+    });
+    mergeIndexPart(index, {
+      configs: { 'org/site': { ew: false, coworker: false, editorTypes: 'f' } },
+      totals: { orgConfigs: 0, siteConfigs: 1 },
+    });
+    expect(index).toEqual({
+      configs: { org: { ew: true, coworker: true }, 'org/site': { ew: false, coworker: false, editorTypes: 'cf' } },
+      totals: { orgConfigs: 1, siteConfigs: 1 },
+    });
+  });
+
+  it('refuses to publish a run with a missing batch', async () => {
+    const env = makeEnv();
+    await expect(completeRun(env, '2026-03-27T06-00-00-000Z', 'run-a', 1))
+      .rejects.toThrow(/Missing index batch/);
+    expect(env.BACKUP_BUCKET.put).not.toHaveBeenCalled();
+  });
+
+  it('refuses to merge staged batches with a broken cursor chain', async () => {
+    const env = makeEnv({}, {
+      [batchKey('run-a', 0)]: JSON.stringify({
+        cursor: null, nextCursor: 'c1', done: false, index: createEmptyIndex(),
+      }),
+      [batchKey('run-a', 1)]: JSON.stringify({
+        cursor: 'different', nextCursor: null, done: true, index: createEmptyIndex(),
+      }),
+    });
+    await expect(completeRun(env, '2026-03-27T06-00-00-000Z', 'run-a', 1))
+      .rejects.toThrow(/Broken cursor chain/);
+    expect(env.BACKUP_BUCKET.put).not.toHaveBeenCalled();
+  });
+
+  it('does not overwrite a newer completed run with a slower older run', async () => {
+    const env = makeEnv();
+    const newIndex = { configs: { new: { ew: true } }, totals: { orgConfigs: 1, siteConfigs: 0 } };
+    const oldIndex = { configs: { old: { ew: false } }, totals: { orgConfigs: 1, siteConfigs: 0 } };
+    await writeIndex(env, '2026-03-28T06-00-00-000Z', newIndex, 'new-run');
+    await writeIndex(env, '2026-03-27T06-00-00-000Z', oldIndex, 'old-run');
+    expect(JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']).configs)
+      .toEqual(newIndex.configs);
+    expect(env.BACKUP_BUCKET._store['_indexes/ew-enabled/old-run.json']).toBeDefined();
+    expect(env.BACKUP_BUCKET._store['_indexes/ew-enabled/new-run.json']).toBeDefined();
+  });
+
+  it('retries publishing latest if another run wins the conditional write', async () => {
+    const env = makeEnv();
+    const older = { configs: { older: { ew: true } }, totals: { orgConfigs: 1, siteConfigs: 0 } };
+    const newer = { configs: { newer: { ew: false } }, totals: { orgConfigs: 1, siteConfigs: 0 } };
+    const originalPut = env.BACKUP_BUCKET.put;
+    let intervened = false;
+    env.BACKUP_BUCKET.put = vi.fn(async (key, payload, options) => {
+      if (key === '_indexes/ew-enabled/latest.json' && !intervened) {
+        intervened = true;
+        await writeIndex(env, '2026-03-28T06-00-00-000Z', newer, 'new-run');
+      }
+      return originalPut(key, payload, options);
+    });
+
+    await writeIndex(env, '2026-03-27T06-00-00-000Z', older, 'old-run');
+    expect(intervened).toBe(true);
+    expect(JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']).configs)
+      .toEqual(newer.configs);
+  });
+
+  it('rejects an immutable snapshot with conflicting index contents', async () => {
+    const env = makeEnv();
+    const older = { configs: { a: { ew: true } }, totals: { orgConfigs: 1, siteConfigs: 0 } };
+    await writeIndex(env, '2026-03-27T06-00-00-000Z', older, 'run-a');
+    await expect(writeIndex(env, '2026-03-27T06-00-00-000Z', {
+      ...older, configs: { a: { ew: false } },
+    }, 'run-a')).rejects.toThrow(/Conflicting completed index snapshot/);
   });
 });
 
@@ -341,7 +467,7 @@ describe('processBatch', () => {
 // ─── queue handler ───────────────────────────────────────────────────────────
 
 describe('queue handler', () => {
-  it('sends next batch message with delay when not done', async () => {
+  it('stages each batch and sends only cursor/run identity to the next consumer', async () => {
     const kv = {
       list: vi.fn().mockResolvedValueOnce({
         keys: [{ name: 'key1' }],
@@ -351,26 +477,78 @@ describe('queue handler', () => {
       get: vi.fn(async () => 'val1'),
     };
     const env = { DA_CONFIG: kv, BACKUP_BUCKET: makeR2(), BACKUP_QUEUE: { send: vi.fn() } };
-    const message = { body: { cursor: null, timestamp: '2026-03-27T06-00-00-000Z' }, ack: vi.fn() };
+    const message = { body: {
+      cursor: null, timestamp: '2026-03-27T06-00-00-000Z', runId: 'run-a', batchNo: 0,
+    }, ack: vi.fn() };
 
     await worker.queue({ messages: [message] }, env);
 
     expect(env.BACKUP_QUEUE.send).toHaveBeenCalledWith({
       cursor: 'cur1',
       timestamp: '2026-03-27T06-00-00-000Z',
-      index: { configs: {}, totals: { orgConfigs: 1, siteConfigs: 0 } },
+      runId: 'run-a',
+      batchNo: 1,
     });
+    expect(JSON.parse(env.BACKUP_BUCKET._store[batchKey('run-a', 0)]).index.totals.orgConfigs).toBe(1);
     expect(message.ack).toHaveBeenCalled();
   });
 
   it('does not send a follow-up message when done', async () => {
     const env = makeEnv({ key1: 'val1' });
-    const message = { body: { cursor: null, timestamp: '2026-03-27T06-00-00-000Z' }, ack: vi.fn() };
+    const message = { body: {
+      cursor: null, timestamp: '2026-03-27T06-00-00-000Z', runId: 'run-a', batchNo: 0,
+    }, ack: vi.fn() };
 
     await worker.queue({ messages: [message] }, env);
 
     expect(env.BACKUP_QUEUE.send).not.toHaveBeenCalled();
     expect(message.ack).toHaveBeenCalled();
+  });
+
+  it('reuses an existing batch on retry without processing keys or double-counting totals', async () => {
+    const kv = makeKv({ org: JSON.stringify({ flags: { data: [{ key: 'ew.enabled', value: 'true' }] } }) });
+    const env = { DA_CONFIG: kv, BACKUP_BUCKET: makeR2(), BACKUP_QUEUE: { send: vi.fn() } };
+    const body = { cursor: null, timestamp: '2026-03-27T06-00-00-000Z', runId: 'run-a', batchNo: 0 };
+    await worker.queue({ messages: [{ body, ack: vi.fn() }] }, env);
+    await worker.queue({ messages: [{ body, ack: vi.fn() }] }, env);
+
+    expect(kv.list).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']).totals.orgConfigs).toBe(1);
+    expect(env.BACKUP_BUCKET._store[batchKey('run-a', 0)]).toBeDefined();
+  });
+
+  it('merges two staged pages into one complete index', async () => {
+    const kv = {
+      list: vi.fn()
+        .mockResolvedValueOnce({ keys: [{ name: 'org' }], list_complete: false, cursor: 'c1' })
+        .mockResolvedValueOnce({ keys: [{ name: 'org/site' }], list_complete: true }),
+      get: vi.fn(async (key) => JSON.stringify({
+        flags: { data: [{ key: 'ew.enabled', value: key === 'org' ? 'true' : 'false' }] },
+      })),
+    };
+    const env = { DA_CONFIG: kv, BACKUP_BUCKET: makeR2(), BACKUP_QUEUE: { send: vi.fn() } };
+    const body = { cursor: null, timestamp: '2026-03-27T06-00-00-000Z', runId: 'run-a', batchNo: 0 };
+    await worker.queue({ messages: [{ body, ack: vi.fn() }] }, env);
+    expect(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']).toBeUndefined();
+
+    await worker.queue({ messages: [{
+      body: env.BACKUP_QUEUE.send.mock.calls[0][0], ack: vi.fn(),
+    }] }, env);
+    const index = JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']);
+    expect(index.totals).toEqual({ orgConfigs: 1, siteConfigs: 1 });
+    expect(index.configs).toEqual({ org: { ew: true }, 'org/site': { ew: false } });
+  });
+
+  it('carries an in-flight legacy queue index into the first R2 batch', async () => {
+    const env = makeEnv({ 'org/site': JSON.stringify({ flags: { data: [] } }) });
+    const index = { configs: { org: { ew: true } }, totals: { orgConfigs: 1, siteConfigs: 0 } };
+    await worker.queue({ messages: [{
+      body: { cursor: 'legacy-cursor', timestamp: '2026-03-27T06-00-00-000Z', index },
+      ack: vi.fn(),
+    }] }, env);
+    const published = JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']);
+    expect(published.configs.org).toEqual({ ew: true });
+    expect(published.totals).toEqual({ orgConfigs: 1, siteConfigs: 1 });
   });
 });
 
@@ -438,7 +616,7 @@ describe('fetch handler', () => {
 
     // No per-key backup archive/latest puts — only the 2 ew-index puts (timestamped + latest)
     expect(env.BACKUP_BUCKET.put).toHaveBeenCalledTimes(2);
-    expect(env.BACKUP_BUCKET.get).not.toHaveBeenCalled();
+    expect(env.BACKUP_BUCKET.get).toHaveBeenCalledWith('_indexes/ew-enabled/latest.json');
 
     const written = JSON.parse(env.BACKUP_BUCKET._store['_indexes/ew-enabled/latest.json']);
     expect(written.totals).toEqual({ orgConfigs: 2, siteConfigs: 0 });

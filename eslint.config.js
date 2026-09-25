@@ -12,6 +12,8 @@ export default [
         Promise: 'readonly',
         Date: 'readonly',
         TextEncoder: 'readonly',
+        Headers: 'readonly',
+        crypto: 'readonly',
       },
     },
     rules: {
