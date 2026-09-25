@@ -3,10 +3,9 @@ import processQueue from '@adobe/helix-shared-process-queue';
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
 const BATCH_SIZE = 200;   // ~200*(2-4) + overhead stays below 1,000 subrequest limit
-const EW_INDEX_SIZE_WARNING_BYTES = 100_000; // headroom under the 128KB queue message cap
-const QUEUE_MESSAGE_MAX_BYTES = 128_000;
 const EDITOR_TYPE_CODES = { canvas: 'c', form: 'f', edit: 'e' };
 const EDITOR_TYPE_CODE_ORDER = ['c', 'f', 'e'];
+const INDEX_PREFIX = '_indexes/ew-enabled';
 
 // ─── ew-enabled index ────────────────────────────────────────────────────────
 //
@@ -22,8 +21,8 @@ const EDITOR_TYPE_CODE_ORDER = ['c', 'f', 'e'];
 //     are intentionally omitted because ew-report usage is only available at
 //     org/site granularity.
 //
-// Each sparse `configs` entry is `{ ew?: boolean, editorTypes?: string }`.
-// `ew` records an explicit ew.enabled value. `editorTypes` is a compact,
+// Each sparse `configs` entry is `{ ew?: boolean, coworker?: boolean, editorTypes?: string }`.
+// `ew` and `coworker` record explicit ew.enabled / ew.coworker flags. `editorTypes` is a compact,
 // canonical string containing any editor.path types configured for that site:
 // `c` = canvas, `f` = form, `e` = classic edit.
 
@@ -31,6 +30,15 @@ export function extractEwEnabledDefault(json) {
   const row = json?.flags?.data?.find((r) => r.key === 'ew.enabled');
   if (!row) return null; // flag not set — no entry emitted, sparse map
   return row.value === 'true' ? 'canvas' : 'edit';
+}
+
+export function extractCoworkerFlag(json) {
+  const row = json?.flags?.data?.find((r) => r.key === 'ew.coworker');
+  if (!row) return null;
+  if (row.value !== 'true' && row.value !== 'false') {
+    console.warn('[da-config-backup] Unexpected ew.coworker flag value; runtime treats it as disabled.');
+  }
+  return row.value === 'true';
 }
 
 export function extractEditorPathOverrides(json) {
@@ -54,6 +62,8 @@ export function buildEwEntries(kvKey, json) {
   const entries = {};
   const defaultType = extractEwEnabledDefault(json);
   if (defaultType) entries[kvKey] = { ew: defaultType === 'canvas' };
+  const coworker = extractCoworkerFlag(json);
+  if (coworker !== null) entries[kvKey] = { ...entries[kvKey], coworker };
   for (const { pathPrefix, type } of extractEditorPathOverrides(json)) {
     const pathSegments = pathPrefix.split('/').filter(Boolean);
     const site = pathSegments[0] === kvKey ? pathSegments[1] : pathSegments[0];
@@ -74,22 +84,26 @@ export function createEmptyIndex() {
   return { configs: {}, totals: { orgConfigs: 0, siteConfigs: 0 } };
 }
 
+function mergeEntries(index, entries) {
+  for (const [configKey, entry] of Object.entries(entries)) {
+    const current = index.configs[configKey] ?? {};
+    const types = new Set(`${current.editorTypes ?? ''}${entry.editorTypes ?? ''}`);
+    index.configs[configKey] = {
+      ...current,
+      ...entry,
+      ...(types.size > 0
+        ? { editorTypes: EDITOR_TYPE_CODE_ORDER.filter((code) => types.has(code)).join('') }
+        : {}),
+    };
+  }
+}
+
 /** Synchronous, single-threaded merge of one batch's processKey results into the accumulator. */
 export function mergeIntoIndex(index, results) {
   for (const result of results) {
     if (!result) continue;
     const { key, entries } = result;
-    for (const [configKey, entry] of Object.entries(entries)) {
-      const current = index.configs[configKey] ?? {};
-      const types = new Set(`${current.editorTypes ?? ''}${entry.editorTypes ?? ''}`);
-      index.configs[configKey] = {
-        ...current,
-        ...entry,
-        ...(types.size > 0
-          ? { editorTypes: EDITOR_TYPE_CODE_ORDER.filter((code) => types.has(code)).join('') }
-          : {}),
-      };
-    }
+    mergeEntries(index, entries);
     if (key.includes('/')) {
       index.totals.siteConfigs += 1;
     } else {
@@ -99,47 +113,137 @@ export function mergeIntoIndex(index, results) {
   return index;
 }
 
-export async function writeIndex(env, timestamp, index) {
+export function mergeIndexPart(index, part) {
+  mergeEntries(index, part.configs);
+  index.totals.orgConfigs += part.totals.orgConfigs;
+  index.totals.siteConfigs += part.totals.siteConfigs;
+  return index;
+}
+
+export function batchKey(runId, batchNo) {
+  return `${INDEX_PREFIX}/runs/${runId}/batch-${batchNo}.json`;
+}
+
+function runIdFor(timestamp) {
+  return `${timestamp}-${crypto.randomUUID()}`;
+}
+
+function previousRunTimestamp(object, body) {
+  const previous = object.customMetadata?.startedAt ?? body.generatedAt;
+  if (!previous) throw new Error('Latest EW index has no run timestamp');
+  return previous.replace(/[:.]/g, '-');
+}
+
+export async function writeIndex(env, timestamp, index, runId = timestamp, harnessFlagsIndexed = true) {
   const payload = JSON.stringify({
     generatedAt: new Date().toISOString(),
+    harnessFlagsIndexed,
     totals: index.totals,
     configs: index.configs,
   }, null, 2);
+  const content = {
+    httpMetadata: { contentType: 'application/json' },
+    customMetadata: { startedAt: timestamp, runId },
+  };
+  const snapshotKey = `${INDEX_PREFIX}/${runId}.json`;
+  const snapshot = await env.BACKUP_BUCKET.put(snapshotKey, payload, {
+    ...content, onlyIf: new Headers({ 'If-None-Match': '*' }),
+  });
+  if (!snapshot) {
+    const existing = await env.BACKUP_BUCKET.get(snapshotKey);
+    if (!existing) throw new Error(`Missing completed index snapshot ${snapshotKey}`);
+    const previous = JSON.parse(await existing.text());
+    if (JSON.stringify(previous.configs) !== JSON.stringify(index.configs)
+      || JSON.stringify(previous.totals) !== JSON.stringify(index.totals)) {
+      throw new Error(`Conflicting completed index snapshot ${snapshotKey}`);
+    }
+  }
 
-  await Promise.all([
-    env.BACKUP_BUCKET.put(`_indexes/ew-enabled/${timestamp}.json`, payload, {
-      httpMetadata: { contentType: 'application/json' },
-    }),
-    env.BACKUP_BUCKET.put('_indexes/ew-enabled/latest.json', payload, {
-      httpMetadata: { contentType: 'application/json' },
-    }),
-  ]);
+  const latestKey = `${INDEX_PREFIX}/latest.json`;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const current = await env.BACKUP_BUCKET.get(latestKey);
+    if (current) {
+      const currentBody = JSON.parse(await current.text());
+      const previousTimestamp = previousRunTimestamp(current, currentBody);
+      if (previousTimestamp > timestamp
+        || (previousTimestamp === timestamp
+          && (current.customMetadata?.runId ?? previousTimestamp) >= runId)) return;
+    }
+    const onlyIf = current
+      ? { etagMatches: current.etag }
+      : new Headers({ 'If-None-Match': '*' });
+    const written = await env.BACKUP_BUCKET.put(latestKey, payload, { ...content, onlyIf });
+    if (written) return;
+  }
+  throw new Error(`Could not publish latest EW index for ${runId}: concurrent writes did not settle`);
+}
+
+async function readBatch(env, runId, batchNo, cursor) {
+  const object = await env.BACKUP_BUCKET.get(batchKey(runId, batchNo));
+  if (!object) return null;
+  const batch = JSON.parse(await object.text());
+  if (batch.cursor !== cursor) throw new Error(`Conflicting cursor in ${batchKey(runId, batchNo)}`);
+  return batch;
+}
+
+async function stageBatch(env, runId, batchNo, batch) {
+  const key = batchKey(runId, batchNo);
+  const written = await env.BACKUP_BUCKET.put(key, JSON.stringify(batch), {
+    httpMetadata: { contentType: 'application/json' },
+    onlyIf: new Headers({ 'If-None-Match': '*' }),
+  });
+  if (written) return batch;
+  const existing = await readBatch(env, runId, batchNo, batch.cursor);
+  if (!existing) throw new Error(`Could not read existing index batch ${key}`);
+  return existing;
+}
+
+export async function completeRun(env, timestamp, runId, lastBatchNo) {
+  const index = createEmptyIndex();
+  let nextCursor = null;
+  for (let batchNo = 0; batchNo <= lastBatchNo; batchNo += 1) {
+    const object = await env.BACKUP_BUCKET.get(batchKey(runId, batchNo));
+    if (!object) throw new Error(`Missing index batch ${batchKey(runId, batchNo)}`);
+    const batch = JSON.parse(await object.text());
+    if ((batchNo > 0 || !runId.endsWith('-legacy')) && batch.cursor !== nextCursor) {
+      throw new Error(`Broken cursor chain at batch ${batchNo} for ${runId}`);
+    }
+    if (batchNo < lastBatchNo && batch.done) throw new Error(`Premature final batch ${batchNo} for ${runId}`);
+    if (batchNo === lastBatchNo && !batch.done) throw new Error(`Incomplete final batch ${batchNo} for ${runId}`);
+    nextCursor = batch.nextCursor;
+    mergeIndexPart(index, batch.index);
+  }
+  await writeIndex(env, timestamp, index, runId, !runId.endsWith('-legacy'));
 }
 
 export default {
   async scheduled(event, env, ctx) {
-    // Kick off a fresh backup session — state travels in the queue message body
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    ctx.waitUntil(env.BACKUP_QUEUE.send({ cursor: null, timestamp, index: createEmptyIndex() }));
+    ctx.waitUntil(env.BACKUP_QUEUE.send({ cursor: null, timestamp, runId: runIdFor(timestamp), batchNo: 0 }));
   },
 
   async queue(batch, env) {
     for (const message of batch.messages) {
       const { cursor, timestamp, index } = message.body;
-      const result = await processBatch(env, cursor, timestamp, index ?? createEmptyIndex());
+      const runId = message.body.runId ?? `${timestamp}-legacy`;
+      const batchNo = message.body.batchNo ?? 0;
+      let staged = await readBatch(env, runId, batchNo, cursor);
+      if (!staged) {
+        const result = await processBatch(env, cursor, timestamp, index ?? createEmptyIndex(), undefined, {
+          skipR2Write: true,
+        });
+        staged = await stageBatch(env, runId, batchNo, {
+          cursor, nextCursor: result.cursor, done: result.done, index: result.index,
+        });
+      }
 
-      if (!result.done) {
-        // Schedule next batch in BATCH_DELAY_S seconds — the accumulator travels
-        // with it, since batches are strictly sequential (max_batch_size: 1)
-        const nextMessage = { cursor: result.cursor, timestamp, index: result.index };
-        const messageSize = new TextEncoder().encode(JSON.stringify(nextMessage)).length;
-        if (messageSize > QUEUE_MESSAGE_MAX_BYTES) {
-          throw new Error(`EW index queue message is ${messageSize} bytes, above the ${QUEUE_MESSAGE_MAX_BYTES}-byte limit`);
-        }
-        if (messageSize > EW_INDEX_SIZE_WARNING_BYTES) {
-          console.warn(`[da-config-backup] EW index queue message is ${messageSize} bytes — approaching the 128KB limit.`);
-        }
-        await env.BACKUP_QUEUE.send(nextMessage);
+      if (staged.done) {
+        await completeRun(env, timestamp, runId, batchNo);
+        console.log(`[da-config-backup] Backup session ${runId} complete.`);
+      } else {
+        await env.BACKUP_QUEUE.send({
+          cursor: staged.nextCursor, timestamp, runId, batchNo: batchNo + 1,
+        });
       }
 
       message.ack();
@@ -163,6 +267,7 @@ export default {
       // returns the computed index directly in the response body instead of
       // "Backup complete" — a fully read-only local test run.
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const runId = runIdFor(timestamp);
       const limit = Number(url.searchParams.get('limit')) || undefined;
       const maxKeys = Number(url.searchParams.get('maxKeys')) || undefined;
       const indexOnly = url.searchParams.has('indexOnly') || url.searchParams.has('dryRun');
@@ -174,7 +279,9 @@ export default {
       let totalKeysProcessed = 0;
       let cappedEarly = false;
       do {
-        result = await processBatch(env, cursor, timestamp, index, limit, options);
+        result = await processBatch(env, cursor, timestamp, index, limit, {
+          ...options, skipR2Write: true,
+        });
         cursor = result.cursor;
         index = result.index;
         totalKeysProcessed += result.keysProcessed;
@@ -185,9 +292,14 @@ export default {
         }
       } while (!result.done);
 
+      if (!dryRun && !cappedEarly) {
+        await writeIndex(env, timestamp, index, runId);
+        console.log(`[da-config-backup] Backup session ${runId} complete.`);
+      }
       if (dryRun) {
         return new Response(JSON.stringify({
           generatedAt: new Date().toISOString(),
+          harnessFlagsIndexed: true,
           partial: cappedEarly,
           keysProcessed: totalKeysProcessed,
           ...index,
@@ -213,7 +325,7 @@ export async function processBatch(env, cursor, timestamp, index = createEmptyIn
 
   if (listed.list_complete) {
     if (!skipR2Write) await writeIndex(env, timestamp, index);
-    console.log(`[da-config-backup] Backup session ${timestamp} complete.`);
+    console.log(`[da-config-backup] Processed all keys for session ${timestamp}.`);
     return { done: true, cursor: null, index, keysProcessed: keyCount };
   }
 

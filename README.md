@@ -9,13 +9,15 @@ Cloudflare Worker that backs up all keys from a DA Config KV namespace to an R2 
 3. **Write** — if the value has changed, writes two R2 objects:
    - `<key>/latest.json` — always reflects the current value
    - `<key>/<timestamp>.json` — immutable timestamped snapshot
-4. **ew-enabled index** — regardless of whether the backup value changed, each key's config is parsed for `ew.enabled` (in the `flags` sheet) and `editor.path` overrides (in the first/`data` sheet). These are accumulated across the whole session and written once, at the end, to:
+4. **EW and harness index** — regardless of whether the backup value changed, each key's config is parsed for `ew.enabled` and `ew.coworker` (in the `flags` sheet) and `editor.path` overrides (in the first/`data` sheet). The scheduled backup writes each batch's compact index contribution to a run-specific R2 key, then merges the completed batches and publishes:
    - `_indexes/ew-enabled/latest.json`
-   - `_indexes/ew-enabled/<timestamp>.json`
+   - `_indexes/ew-enabled/<timestamp>-<uuid>.json`
 
-   The sparse `configs` map is keyed by `org` or `org/site`. Each entry is `{ ew?: boolean, editorTypes?: string }`: `ew` records an explicitly configured `ew.enabled` value, while `editorTypes` summarizes which `editor.path` editors occur anywhere in that site (`c` = canvas, `f` = form, `e` = classic edit). Individual content paths are intentionally omitted because ew-report usage metrics are only available at org/site granularity. Org-level `editor.path` rows are attributed to the site named by the first path segment.
+   Fresh indexes include `harnessFlagsIndexed: true`, so consumers can distinguish an absent `ew.coworker` flag from an older index that never extracted harness flags. An in-flight queue run started before the upgrade is marked `false` because its earlier batches did not extract those flags. The sparse `configs` map is keyed by `org` or `org/site`. Each entry is `{ ew?: boolean, coworker?: boolean, editorTypes?: string }`: `ew` and `coworker` record explicitly configured `ew.enabled` and `ew.coworker` values; an absent `coworker` defaults to da-agent, while an explicit site-level value (including `false`) overrides the org-level value. `editorTypes` summarizes which `editor.path` editors occur anywhere in that site (`c` = canvas, `f` = form, `e` = classic edit). Individual content paths are intentionally omitted because ew-report usage metrics are only available at org/site granularity. Org-level `editor.path` rows are attributed to the site named by the first path segment.
 
-   Since Workers invocations don't share memory across queue messages, the in-progress index travels *inside* the queue message body itself (alongside `cursor`/`timestamp`) and is written to R2 exactly once, by the single invocation that sees `list_complete`.
+   Queue messages contain only the cursor, start timestamp, run ID, and batch number. Staged objects use `_indexes/ew-enabled/runs/<run-id>/batch-<number>.json`. Retried messages reuse their staged batch instead of re-counting its keys; the final merge requires every batch and a contiguous cursor chain. The snapshot is written once per run, and `latest.json` is updated with an R2 conditional write only if the run started after the current latest run. Runs can overlap without overwriting one another's staged data or publishing an older snapshot over a newer one. The `/run` HTTP endpoint still accumulates in memory for local testing and writes no staging objects.
+
+   Staged objects are retained for replay safety (including queue retries). Set an R2 lifecycle expiration for the `runs/` prefix **longer than the queue's message retention period** if automatic cleanup is desired; do not expire the completed snapshots or `latest.json`.
 
 Keys with path segments (containing `/`) are encoded per-segment so the R2 hierarchy is preserved. Keys with no change since the last run are skipped for the backup write (the ew-index is still updated for them). Failed keys are retried up to 3 times with exponential backoff.
 
@@ -25,7 +27,8 @@ Keys with path segments (containing `/`) are encoded per-segment so the R2 hiera
 <encoded-key>/latest.json                      ← current value (overwritten each run)
 <encoded-key>/2026-03-26T06-00-00-000Z.json    ← snapshot written on change
 _indexes/ew-enabled/latest.json                ← aggregate ew-enabled index (current)
-_indexes/ew-enabled/2026-03-26T06-00-00-000Z.json  ← aggregate snapshot for this session
+_indexes/ew-enabled/2026-03-26T06-00-00-000Z-<uuid>.json  ← completed snapshot
+_indexes/ew-enabled/runs/<timestamp>-<uuid>/batch-0.json  ← staged batch contribution
 ```
 
 ## Schedule
@@ -95,11 +98,11 @@ The `/run` endpoint triggers a full backup synchronously, which is useful for te
   ```bash
   curl "http://localhost:8787/run?indexOnly=1"
   ```
-- **`/run?dryRun=1`** — fully read-only: also skips writing the index to R2, and returns the computed `{ generatedAt, totals, paths }` JSON directly in the response body instead of "Backup complete", so you can inspect the result locally without touching R2 at all. Combine with `maxKeys` for a fast, bounded, zero-write test run:
+- **`/run?dryRun=1`** — fully read-only: also skips writing the index to R2, and returns the computed `{ generatedAt, totals, configs }` JSON directly in the response body instead of "Backup complete", so you can inspect the result locally without touching R2 at all. Combine with `maxKeys` for a fast, bounded, zero-write test run:
   ```bash
   curl "http://localhost:8787/run?dryRun=1&maxKeys=50" | jq .
   ```
-- **Trigger the real cron + queue path** — validates that the `{ cursor, timestamp, index }` accumulator actually survives serialization across queue messages (important before deploying changes near the 128KB message-size limit):
+- **Trigger the real cron + queue path** — validates run-scoped R2 staging, small `{ cursor, timestamp, runId, batchNo }` queue messages, and final publication:
   ```bash
   curl "http://localhost:8787/__scheduled"
   ```
