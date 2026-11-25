@@ -21,8 +21,11 @@ const INDEX_PREFIX = '_indexes/ew-enabled';
 //     are intentionally omitted because ew-report usage is only available at
 //     org/site granularity.
 //
-// Each sparse `configs` entry is `{ ew?: boolean, coworker?: boolean, editorTypes?: string }`.
-// `ew` and `coworker` record explicit ew.enabled / ew.coworker flags. `editorTypes` is a compact,
+// Each sparse `configs` entry is
+// `{ ew?: boolean, coworker?: boolean | 'cma', disableChat?: boolean, editorTypes?: string }`.
+// `ew`, `coworker` and `disableChat` record explicit ew.enabled / ew.coworker / ew.disableChat flags.
+// `coworker` mirrors da-nx's harness resolution: true = Coworker, 'cma' = CMA, false = da-agent.
+// `editorTypes` is a compact,
 // canonical string containing any editor.path types configured for that site:
 // `c` = canvas, `f` = form, `e` = classic edit.
 
@@ -35,8 +38,18 @@ export function extractEwEnabledDefault(json) {
 export function extractCoworkerFlag(json) {
   const row = json?.flags?.data?.find((r) => r.key === 'ew.coworker');
   if (!row) return null;
+  if (row.value === 'cma') return 'cma';
   if (row.value !== 'true' && row.value !== 'false') {
-    console.warn('[da-config-backup] Unexpected ew.coworker flag value; runtime treats it as disabled.');
+    console.warn('[da-config-backup] Unexpected ew.coworker flag value; runtime treats it as da-agent.');
+  }
+  return row.value === 'true';
+}
+
+export function extractDisableChatFlag(json) {
+  const row = json?.flags?.data?.find((r) => r.key === 'ew.disableChat');
+  if (!row) return null;
+  if (row.value !== 'true' && row.value !== 'false') {
+    console.warn('[da-config-backup] Unexpected ew.disableChat flag value; runtime treats it as chat enabled.');
   }
   return row.value === 'true';
 }
@@ -64,6 +77,8 @@ export function buildEwEntries(kvKey, json) {
   if (defaultType) entries[kvKey] = { ew: defaultType === 'canvas' };
   const coworker = extractCoworkerFlag(json);
   if (coworker !== null) entries[kvKey] = { ...entries[kvKey], coworker };
+  const disableChat = extractDisableChatFlag(json);
+  if (disableChat !== null) entries[kvKey] = { ...entries[kvKey], disableChat };
   for (const { pathPrefix, type } of extractEditorPathOverrides(json)) {
     const pathSegments = pathPrefix.split('/').filter(Boolean);
     const site = pathSegments[0] === kvKey ? pathSegments[1] : pathSegments[0];

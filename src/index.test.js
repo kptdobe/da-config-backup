@@ -4,6 +4,7 @@ import worker, {
   processKey,
   extractEwEnabledDefault,
   extractCoworkerFlag,
+  extractDisableChatFlag,
   extractEditorPathOverrides,
   buildEwEntries,
   createEmptyIndex,
@@ -109,6 +110,40 @@ describe('extractEwEnabledDefault', () => {
         warn.mockRestore();
       }
     });
+
+    it('records the CMA harness value', () => {
+      expect(extractCoworkerFlag({ flags: { data: [{ key: 'ew.coworker', value: 'cma' }] } })).toBe('cma');
+    });
+
+    it('matches the CMA value exactly, like the runtime', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        expect(extractCoworkerFlag({ flags: { data: [{ key: 'ew.coworker', value: 'CMA' }] } })).toBe(false);
+        expect(extractCoworkerFlag({ flags: { data: [{ key: 'ew.coworker', value: ' cma' }] } })).toBe(false);
+        expect(warn).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
+  describe('extractDisableChatFlag', () => {
+    it('records both explicit true and false, but not an absent flag', () => {
+      expect(extractDisableChatFlag({ flags: { data: [{ key: 'ew.disableChat', value: 'true' }] } })).toBe(true);
+      expect(extractDisableChatFlag({ flags: { data: [{ key: 'ew.disableChat', value: 'false' }] } })).toBe(false);
+      expect(extractDisableChatFlag({ flags: { data: [{ key: 'ew.enabled', value: 'true' }] } })).toBeNull();
+      expect(extractDisableChatFlag({})).toBeNull();
+    });
+
+    it('preserves an invalid explicit value as chat enabled, matching the runtime', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        expect(extractDisableChatFlag({ flags: { data: [{ key: 'ew.disableChat', value: 'yes' }] } })).toBe(false);
+        expect(warn).toHaveBeenCalledOnce();
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   it('returns "edit" when ew.enabled is "false"', () => {
@@ -176,6 +211,18 @@ describe('buildEwEntries', () => {
         { key: 'ew.coworker', value: 'false' },
       ] },
     })).toEqual({ 'org/site': { ew: true, coworker: false } });
+  });
+
+  it('records CMA harness and explicit ew.disableChat flags', () => {
+    expect(buildEwEntries('org/site', {
+      flags: { data: [
+        { key: 'ew.coworker', value: 'cma' },
+        { key: 'ew.disableChat', value: 'true' },
+      ] },
+    })).toEqual({ 'org/site': { coworker: 'cma', disableChat: true } });
+    expect(buildEwEntries('org', {
+      flags: { data: [{ key: 'ew.disableChat', value: 'false' }] },
+    })).toEqual({ org: { disableChat: false } });
   });
 
   it('editor.path override coexists with a differing ew.enabled default at the same key', () => {
